@@ -3,6 +3,7 @@ const { google } = require("googleapis");
 const OAuth2 = google.auth.OAuth2;
 const cors = require("cors");
 const bodyParser = require("body-parser");
+const mongodb = require("mongodb");
 
 const corsOptions = {
   origin: "http://localhost:3001",
@@ -42,7 +43,7 @@ app.get("/auth/google/callback", async (req, res) => {
   res.redirect(`http://localhost:3001?accessToken=${tokens.access_token}`);
 });
 
-function getPlaylistItems(youtube, channel) {
+function getPlaylistItems(youtube, channel, constraints) {
   return new Promise((resolve) => {
     youtube.playlistItems
       .list({
@@ -56,7 +57,7 @@ function getPlaylistItems(youtube, channel) {
   });
 }
 
-function getChannels(youtube, channelIds) {
+function getChannels(youtube, channelIds, constraints) {
   return new Promise((resolve) => {
     youtube.channels
       .list({
@@ -72,7 +73,7 @@ function getChannels(youtube, channelIds) {
   });
 }
 
-function firstPass(youtube) {
+function firstPass(youtube, constraints = {}) {
   return new Promise(async (resolve) => {
     await youtube.subscriptions
       .list({
@@ -104,7 +105,7 @@ app.post("/firstpass", async (req, res) => {
   });
 
   const bigFriendlyObject = await firstPass(youtube);
-  console.log(bigFriendlyObject);
+  res.json(bigFriendlyObject);
 });
 
 const PORT = process.env.PORT || 3000;
