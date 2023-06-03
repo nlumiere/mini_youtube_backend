@@ -3,14 +3,27 @@ const { google } = require("googleapis");
 const OAuth2 = google.auth.OAuth2;
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const { MongoClient } = require("mongodb");
+const { MongoClient, ServerApiVersion } = require("mongodb");
 const session = require("express-session");
 require("dotenv").config();
 
-const dburl = "mongodb://localhost:27017";
-const mongoClient = new MongoClient(dburl);
+const MONGO_URI = `mongodb+srv://${process.env.MONGO_USERNAME}:${process.env.MONGO_PASSWORD}@proto.deabf88.mongodb.net/?retryWrites=true&w=majority`;
+
+const mongoClient = new MongoClient(MONGO_URI, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  }
+});
 
 const DBNAME = "app";
+
+async function mongoConnect() {
+  await mongoClient.connect();
+  console.log("Connected to database");
+  return "done.";
+}
 
 const corsOptions = {
   origin: "http://localhost:3001",
@@ -25,11 +38,17 @@ app.use(bodyParser.json());
 app.use(cors(corsOptions));
 app.use(
   session({
+    name: 'connect.sid',
     secret: "hehe-secret",
     resave: false,
     saveUninitialized: true,
-    cookie: { secure: "auto", maxAge: 86400000 },
-  })
+    cookie: { 
+      httpOnly: true,
+      secure: false,
+      maxAge: 24 * 60 * 60 * 1000,
+      sameSite: 'lax', },
+      path: '/'
+    })
 );
 
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -66,15 +85,6 @@ app.get("/auth/google/callback", async (req, res) => {
   res.redirect(CLIENT_REDIRECT_URI);
 });
 
-async function mongoConnect() {
-  await mongoClient.connect();
-  console.log("Connected to database");
-  const db = mongoClient.db(DBNAME);
-  const collection = db.collection("test");
-  console.log(collection);
-  return "done.";
-}
-
 function getPlaylistItems(youtube, channel, constraints) {
   return new Promise((resolve) => {
     youtube.playlistItems
@@ -101,7 +111,7 @@ function getChannels(youtube, channelIds, constraints) {
           getPlaylistItems(youtube, channel)
         );
         resolve(Promise.all(promiseList));
-      });
+      })
   });
 }
 
@@ -125,6 +135,20 @@ function firstPass(youtube, constraints = {}) {
   });
 }
 
+function getDetailedVideoInfo(youtube, videoIds, constraints = {}) {
+  console.log("here");
+  // TODO: Additional call (think about maybe reducing initial data)
+  return new Promise(async (resolve) => {
+    console.log(videoIds);
+    await youtube.videos.list({
+      part: ["snippet", "contentDetails"],
+      id: videoIds
+    }).then((data) => {
+      resolve(data);
+    })
+  });
+}
+
 app.post("/firstpass", async (req, res) => {
   const oauth2Client = getOAuth2Client(req);
 
@@ -138,9 +162,25 @@ app.post("/firstpass", async (req, res) => {
     auth: oauth2Client,
   });
 
-  const bigFriendlyObject = await firstPass(youtube);
-  res.json(bigFriendlyObject);
+  const playlistItemsObj = await firstPass(youtube);
+  const idsList = [];
+  playlistItemsObj.forEach((channel) => {
+    channel.forEach((item) => {
+      idsList.push(item["snippet"]["resourceId"]["videoId"]);
+    });
+  });
+  const bigFriendlyObject = await getDetailedVideoInfo(youtube, idsList);
+  // console.log(bigFriendlyObject["data"]["items"]);
+  res.json(bigFriendlyObject["data"]["items"]);
 });
+
+async function getChannelUid(youtube) {
+  const data = await youtube.channels.list({
+    part: "snippet",
+    mine: true
+  });
+  return data.data.items[0].id;
+}
 
 app.post("/logout", (req, res) => {
   const oauth2Client = getOAuth2Client(req);
@@ -153,37 +193,72 @@ app.post("/logout", (req, res) => {
 
     oauth2Client.setCredentials(null);
 
+    oauth2Client.generateAuthUrl({
+      access_type: "offline",
+      scope: SCOPES,
+    });
+    res.clearCookie('connect.sid', { path: '/', sameSite: 'lax', httpOnly: true, secure: false,maxAge: 24 * 60 * 60 * 1000 });
     res.redirect(CLIENT_REDIRECT_URI);
   });
 });
 
-// FOR TESTING ONLY, REMOVE BEFORE PRODUCTION OF ANY KIND
 app.post("/ping", async (req, res) => {
-  const oauth2Client = getOAuth2Client(req);
-
-  if (!req.session.tokens) {
+  if (!req.session || !req.session.tokens) {
     res.status(401).send("Unauthorized");
     return;
   }
 
-  console.log("CREDENTIALS", oauth2Client.credentials);
-
-  // const youtube = google.youtube({
-  //   version: "v3",
-  //   auth: oauth2Client,
-  // });
-  // youtube.channels
-  //   .list({
-  //     part: "snippet,statistics",
-  //     mine: "true",
-  //     access_token: oauth2Client.credentials.access_token,
-  //   })
-  //   .then((response) => {
-  //     console.log(response.data.items);
-  //   });
-
   res.send("pong");
 });
+
+app.post("/update_profile", async (req, res) => {
+  if (!req.session || !req.session.tokens) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const oauth2Client = getOAuth2Client(req);
+  const youtube = google.youtube({
+    version: "v3",
+    auth: oauth2Client,
+  });
+
+  mongoConnect();
+
+  const cid = await getChannelUid(youtube);
+  const db = mongoClient.db(DBNAME);
+  const collection = db.collection("dev");
+  const query = {[`${cid}.settings`]: {$exists: true}};
+  const update = {
+    $set: {
+      [`${cid}.settings`]: req.body
+    }
+  }
+  collection.updateOne(query, update);
+  res.json({status: "happy"});
+});
+
+app.post("/debug", async (req, res) => {
+  if (!req.session || !req.session.tokens) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const oauth2Client = getOAuth2Client(req);
+  const youtube = google.youtube({
+    version: "v3",
+    auth: oauth2Client,
+  });
+
+  const cid = await getChannelUid(youtube);
+
+  mongoConnect();
+  const db = mongoClient.db(DBNAME);
+  const collection = db.collection("dev");
+  const query = {[cid]: {}};
+  const update = {[cid]: {settings: {test: "test"}, data: {}}};
+  collection.updateOne(query, {$set: update});
+})
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
