@@ -20,9 +20,12 @@ const mongoClient = new MongoClient(MONGO_URI, {
 const DBNAME = "app";
 
 async function mongoConnect() {
-  await mongoClient.connect();
-  console.log("Connected to database");
-  return "done.";
+  try {
+    await mongoClient.connect();
+    console.log("connected to database");
+  } catch (err) {
+    console.error(err);
+  }
 }
 
 const corsOptions = {
@@ -51,6 +54,10 @@ app.use(
     })
 );
 
+const YOUTUBE_CATEGORY_IDS = {
+  10: "music",
+  20: "gaming",
+}
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const REDIRECT_URI = "http://localhost:3000/auth/google/callback";
@@ -135,11 +142,9 @@ function firstPass(youtube, constraints = {}) {
   });
 }
 
-function getDetailedVideoInfo(youtube, videoIds, constraints = {}) {
-  console.log("here");
+function getDetailedVideoInfo(youtube, videoIds) {
   // TODO: Additional call (think about maybe reducing initial data)
   return new Promise(async (resolve) => {
-    console.log(videoIds);
     await youtube.videos.list({
       part: ["snippet", "contentDetails"],
       id: videoIds
@@ -152,6 +157,8 @@ function getDetailedVideoInfo(youtube, videoIds, constraints = {}) {
 app.post("/firstpass", async (req, res) => {
   const oauth2Client = getOAuth2Client(req);
 
+  mongoConnect();
+
   if (!req.session.tokens) {
     res.status(401).send("Unauthorized");
     return;
@@ -162,6 +169,14 @@ app.post("/firstpass", async (req, res) => {
     auth: oauth2Client,
   });
 
+  const cid = await getChannelUid(youtube);
+
+  const db = mongoClient.db(DBNAME);
+  const collection = db.collection("dev");
+  const query = {[`${cid}.settings`]: {$exists: true}};
+  const userPrefs = await collection.findOne(query);
+  const filters = userPrefs[cid]["settings"]
+
   const playlistItemsObj = await firstPass(youtube);
   const idsList = [];
   playlistItemsObj.forEach((channel) => {
@@ -170,7 +185,21 @@ app.post("/firstpass", async (req, res) => {
     });
   });
   const bigFriendlyObject = await getDetailedVideoInfo(youtube, idsList);
-  // console.log(bigFriendlyObject["data"]["items"]);
+  const videos = bigFriendlyObject["data"]["items"];
+  for (let i = 0; i < videos.length; i++) {
+    const category =  YOUTUBE_CATEGORY_IDS[videos[i]["snippet"]["categoryId"]];
+    const duration = videos[i]["contentDetails"]["duration"];
+    const minutesMatch = duration.match(/(\d+)M/);
+    const minutes = minutesMatch ? parseInt(minutesMatch[1]) : 0;
+    if (minutes < filters["vidlength"]) {
+      console.log(`Removing video because length was ${minutes}.`);
+      videos[i] = null;
+    }
+    else if(Object.keys(filters).includes(category) && !filters[category]) {
+      console.log(`Removing video because category was ${category}.`);
+      videos[i] = null;
+    }
+  }
   res.json(bigFriendlyObject["data"]["items"]);
 });
 
@@ -223,9 +252,9 @@ app.post("/update_profile", async (req, res) => {
     auth: oauth2Client,
   });
 
+  const cid = await getChannelUid(youtube);
   mongoConnect();
 
-  const cid = await getChannelUid(youtube);
   const db = mongoClient.db(DBNAME);
   const collection = db.collection("dev");
   const query = {[`${cid}.settings`]: {$exists: true}};
@@ -236,6 +265,27 @@ app.post("/update_profile", async (req, res) => {
   }
   collection.updateOne(query, update);
   res.json({status: "happy"});
+});
+
+app.post("/get_profile", async (req, res) => {
+  if (!req.session || !req.session.tokens) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const oauth2Client = getOAuth2Client(req);
+  const youtube = google.youtube({
+    version: "v3",
+    auth: oauth2Client,
+  });
+  const cid = await getChannelUid(youtube);
+  mongoConnect();
+  const db = mongoClient.db(DBNAME);
+  const collection = db.collection("dev");
+  const query = {[`${cid}.settings`]: {$exists: true}};
+  const dbres = await collection.findOne(query);
+  const userSettings = dbres[`${cid}`]["settings"];
+  res.json(userSettings);
 });
 
 app.post("/debug", async (req, res) => {
@@ -258,7 +308,7 @@ app.post("/debug", async (req, res) => {
   const query = {[cid]: {}};
   const update = {[cid]: {settings: {test: "test"}, data: {}}};
   collection.updateOne(query, {$set: update});
-})
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
