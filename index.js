@@ -98,7 +98,7 @@ function getPlaylistItems(youtube, channel, constraints) {
       .list({
         part: "id,snippet",
         playlistId: channel.contentDetails.relatedPlaylists.uploads,
-        maxResults: 5,
+        maxResults: constraints["numVideos"],
       })
       .then((playlistItemsData) => {
         resolve(playlistItemsData.data.items);
@@ -115,27 +115,28 @@ function getChannels(youtube, channelIds, constraints) {
       })
       .then((channelData) => {
         const promiseList = channelData.data.items.map((channel) =>
-          getPlaylistItems(youtube, channel)
+          getPlaylistItems(youtube, channel, constraints)
         );
         resolve(Promise.all(promiseList));
       })
   });
 }
 
-function firstPass(youtube, constraints = {}) {
+// Use for users with no data/use on video clicked
+function getVideosBySubscribers(youtube, constraints={numSubscriptions: 5, numVideos: 5}) {
   return new Promise(async (resolve) => {
     await youtube.subscriptions
       .list({
         part: "snippet,contentDetails",
         mine: "true",
-        maxResults: 5,
+        maxResults: constraints["numSubscriptions"],
       })
       .then(async (data) => {
         let channelIds = [];
         data.data.items.forEach((channel) => {
           channelIds.push(channel.snippet.resourceId.channelId);
         });
-        getChannels(youtube, channelIds).then((channels) => {
+        getChannels(youtube, channelIds, constraints).then((channels) => {
           resolve(channels);
         });
       });
@@ -154,6 +155,124 @@ function getDetailedVideoInfo(youtube, videoIds) {
   });
 }
 
+function writeVideoDataToDatabase(cid, mongoClient, bfg) {
+  const videoDataWrites = [];
+  const usageDataWrites = [];
+  bfg.forEach((item) => {
+    // both videos and usage data
+    const videoId = item["id"];
+
+    // only video data
+    const videoTitle = item["snippet"]["title"];
+    const channelId = item["snippet"]["channelId"];
+    const channelTitle = item["snippet"]["channelTitle"];
+    const views = 0;
+    const uploadDate = "";
+    const videoLength = item["contentDetails"]["duration"];
+    const categoryId = item["snippet"]["categoryId"];
+    const thumbnail = item["snippet"]["thumbnails"]["default"]["url"];
+
+    // only usage data
+    const timeSpentWatching = 0;
+    const numClicks = 0;
+    const numTimesShown = 0;
+    const rawScore = 0;
+    const isLiked = 0; // -1, 0, 1
+    const isSubscribed = false;
+
+    videoDataWrites.push(
+      {
+        updateOne: {
+          filter: { [videoId]: {$exists: true}},
+          update: {$set: { [videoId]: {
+            videoTitle: videoTitle,
+            channelId: channelId,
+            channelTitle: channelTitle,
+            views: views,
+            uploadDate: uploadDate,
+            videoLength: videoLength,
+            categoryId: categoryId,
+            thumbnail: thumbnail
+          }}},
+          upsert: true
+        }
+      }
+    );
+
+    usageDataWrites.push(
+      {
+        updateOne: {
+          filter: { [`${cid}`]: {$exists: true}},
+          update: {$set: { [`${cid}.data.${videoId}`]: {
+            timeSpentWatching: timeSpentWatching,
+            numClicks: numClicks,
+            numTimesShown: numTimesShown,
+            isLiked: isLiked,
+            isSubscribed: isSubscribed,
+            rawScore: rawScore
+          }}},
+          upsert: true
+        }
+      }
+    );
+  });
+
+  const db = mongoClient.db(DBNAME);
+  const profilesCollection = db.collection("dev");
+  const videosCollection = db.collection("videos");
+
+  try {
+    videosCollection.bulkWrite(videoDataWrites);
+  } catch (err) {
+    console.error(err);
+  }
+
+  try {
+    profilesCollection.bulkWrite(usageDataWrites);
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+function filterVideos(videos, filters) {
+  for (let i = 0; i < videos.length; i++) {
+    const category =  YOUTUBE_CATEGORY_IDS[videos[i]["snippet"]["categoryId"]];
+    const duration = videos[i]["contentDetails"]["duration"];
+    const minutesMatch = duration.match(/(\d+)M/);
+    const minutes = minutesMatch ? parseInt(minutesMatch[1]) : 0;
+    if (minutes < filters["vidlength"]) {
+      // console.log(`Removing video because length was ${minutes}.`);
+      videos[i] = null;
+    }
+    else if(Object.keys(filters).includes(category) && !filters[category]) {
+      // console.log(`Removing video because category was ${category}.`);
+      videos[i] = null;
+    }
+  }
+  return videos;
+}
+
+function filterVideos2(videos, filters) {
+  for (let i = 0; i < videos.length; i++) {
+    const id = Object.keys(videos[i])[1];
+    const metadata = videos[i][id];
+    const category = YOUTUBE_CATEGORY_IDS[parseInt(metadata["categoryId"])];
+    const duration = metadata["videoLength"];
+    const minutesMatch = duration.match(/(\d+)M/);
+    const minutes = minutesMatch ? parseInt(minutesMatch[1]) : 0;
+    if (minutes < filters["vidlength"]) {
+      // console.log(`Removing video because length was ${minutes}.`);
+      videos[i] = null;
+    }
+    else if(Object.keys(filters).includes(category) && !filters[category]) {
+      // console.log(`Removing video because category was ${category}.`);
+      videos[i] = null;
+    }
+  }
+  return videos;
+}
+
+// TODO: Massage bfg video data to be mongo compatible
 app.post("/firstpass", async (req, res) => {
   const oauth2Client = getOAuth2Client(req);
 
@@ -174,33 +293,72 @@ app.post("/firstpass", async (req, res) => {
   const db = mongoClient.db(DBNAME);
   const collection = db.collection("dev");
   const query = {[`${cid}.settings`]: {$exists: true}};
-  const userPrefs = await collection.findOne(query);
-  const filters = userPrefs[cid]["settings"]
+  const userData = await collection.findOne(query);
 
-  const playlistItemsObj = await firstPass(youtube);
-  const idsList = [];
-  playlistItemsObj.forEach((channel) => {
-    channel.forEach((item) => {
-      idsList.push(item["snippet"]["resourceId"]["videoId"]);
-    });
-  });
-  const bigFriendlyObject = await getDetailedVideoInfo(youtube, idsList);
-  const videos = bigFriendlyObject["data"]["items"];
-  for (let i = 0; i < videos.length; i++) {
-    const category =  YOUTUBE_CATEGORY_IDS[videos[i]["snippet"]["categoryId"]];
-    const duration = videos[i]["contentDetails"]["duration"];
-    const minutesMatch = duration.match(/(\d+)M/);
-    const minutes = minutesMatch ? parseInt(minutesMatch[1]) : 0;
-    if (minutes < filters["vidlength"]) {
-      console.log(`Removing video because length was ${minutes}.`);
-      videos[i] = null;
-    }
-    else if(Object.keys(filters).includes(category) && !filters[category]) {
-      console.log(`Removing video because category was ${category}.`);
-      videos[i] = null;
-    }
+  if (!userData) {
+    return;
   }
-  res.json(bigFriendlyObject["data"]["items"]);
+
+  const filters = userData[cid]["settings"];
+  const usageData = userData[cid]["data"];
+  if (!usageData && filters) {
+    const playlistItemsObj = await getVideosBySubscribers(youtube/*, {numSubscriptions: 100, numVideos: 40}*/);
+
+    const idsList = [];
+    playlistItemsObj.forEach((channel) => {
+      channel.forEach((item) => {
+        idsList.push(item["snippet"]["resourceId"]["videoId"]);
+      });
+    });
+    const bigFriendlyObject = await getDetailedVideoInfo(youtube, idsList);
+    const videos = bigFriendlyObject["data"]["items"];
+
+    writeVideoDataToDatabase(cid, mongoClient, bigFriendlyObject["data"]["items"]);
+  }
+
+  res.status(269).send();
+});
+
+app.post("/retrieveVideos", async (req, res) => {
+  const oauth2Client = getOAuth2Client(req);
+
+  mongoConnect();
+
+  if (!req.session.tokens) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const youtube = google.youtube({
+    version: "v3",
+    auth: oauth2Client,
+  });
+
+  const cid = await getChannelUid(youtube);
+
+  const db = mongoClient.db(DBNAME);
+  const usageCollection = db.collection("dev");
+  const videosCollection = db.collection("videos");
+  const usageQuery = {[`${cid}.settings`]: {$exists: true}};
+  const userData = await usageCollection.findOne(usageQuery);
+
+  if (!userData) {
+    return;
+  }
+
+  const filters = userData[cid]["settings"];
+  const usageData = userData[cid]["data"];
+
+  if (!filters || !usageData) {
+    return;
+  }
+  const queryArray = Object.keys(usageData).map((key) => {
+    return {[key]: {$exists: true}};
+  });
+  const videosQuery = { $or: queryArray };
+  const videos = await videosCollection.find(videosQuery).toArray();
+  const filteredVideos = filterVideos2(videos, filters);
+  res.json(filteredVideos);
 });
 
 async function getChannelUid(youtube) {
@@ -246,6 +404,12 @@ app.post("/update_profile", async (req, res) => {
     return;
   }
 
+  try {
+    req.body["vidlength"] = Math.max(parseInt(req.body["vidlength"]));
+  } catch {
+    req.body["vidlength"] = 0;
+  }
+
   const oauth2Client = getOAuth2Client(req);
   const youtube = google.youtube({
     version: "v3",
@@ -263,7 +427,7 @@ app.post("/update_profile", async (req, res) => {
       [`${cid}.settings`]: req.body
     }
   }
-  collection.updateOne(query, update);
+  collection.updateOne(query, update, {upsert: true});
   res.json({status: "happy"});
 });
 
@@ -284,8 +448,16 @@ app.post("/get_profile", async (req, res) => {
   const collection = db.collection("dev");
   const query = {[`${cid}.settings`]: {$exists: true}};
   const dbres = await collection.findOne(query);
-  const userSettings = dbres[`${cid}`]["settings"];
-  res.json(userSettings);
+  try {
+    res.json(dbres[`${cid}`]["settings"]);
+  } catch {
+    res.json({
+      vidlength: "0",
+      gaming: true,
+      music: true,
+      other: true,
+    });
+  }
 });
 
 app.post("/debug", async (req, res) => {
