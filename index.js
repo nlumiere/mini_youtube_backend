@@ -22,7 +22,7 @@ const DBNAME = "app";
 async function mongoConnect() {
   try {
     await mongoClient.connect();
-    console.log("connected to database");
+    // console.log("connected to database");
   } catch (err) {
     console.error(err);
   }
@@ -155,7 +155,7 @@ function getDetailedVideoInfo(youtube, videoIds) {
   });
 }
 
-function writeVideoDataToDatabase(cid, mongoClient, bfg) {
+function writeVideoDataToDatabase(cid, bfg, recommended=false) {
   const videoDataWrites = [];
   const usageDataWrites = [];
   bfg.forEach((item) => {
@@ -170,13 +170,15 @@ function writeVideoDataToDatabase(cid, mongoClient, bfg) {
     const uploadDate = "";
     const videoLength = item["contentDetails"]["duration"];
     const categoryId = item["snippet"]["categoryId"];
+    const tags = item["snippet"]["tags"];
     const thumbnail = item["snippet"]["thumbnails"]["default"]["url"];
+    // ...snippet.publishedAt (?)
 
     // only usage data
     const timeSpentWatching = 0;
     const numClicks = 0;
     const numTimesShown = 0;
-    const rawScore = 0;
+    const rawScore = recommended ? 57: 50;
     const isLiked = 0; // -1, 0, 1
     const isSubscribed = false;
 
@@ -192,6 +194,7 @@ function writeVideoDataToDatabase(cid, mongoClient, bfg) {
             uploadDate: uploadDate,
             videoLength: videoLength,
             categoryId: categoryId,
+            tags: tags,
             thumbnail: thumbnail
           }}},
           upsert: true
@@ -236,24 +239,6 @@ function writeVideoDataToDatabase(cid, mongoClient, bfg) {
 
 function filterVideos(videos, filters) {
   for (let i = 0; i < videos.length; i++) {
-    const category =  YOUTUBE_CATEGORY_IDS[videos[i]["snippet"]["categoryId"]];
-    const duration = videos[i]["contentDetails"]["duration"];
-    const minutesMatch = duration.match(/(\d+)M/);
-    const minutes = minutesMatch ? parseInt(minutesMatch[1]) : 0;
-    if (minutes < filters["vidlength"]) {
-      // console.log(`Removing video because length was ${minutes}.`);
-      videos[i] = null;
-    }
-    else if(Object.keys(filters).includes(category) && !filters[category]) {
-      // console.log(`Removing video because category was ${category}.`);
-      videos[i] = null;
-    }
-  }
-  return videos;
-}
-
-function filterVideos2(videos, filters) {
-  for (let i = 0; i < videos.length; i++) {
     const id = Object.keys(videos[i])[1];
     const metadata = videos[i][id];
     const category = YOUTUBE_CATEGORY_IDS[parseInt(metadata["categoryId"])];
@@ -269,7 +254,82 @@ function filterVideos2(videos, filters) {
       videos[i] = null;
     }
   }
-  return videos;
+  const filteredVideos = videos.filter(item => item !== null);
+  return filteredVideos;
+}
+
+async function adjustScoresOnClick(clickedId, clickedVideo, videos, cid, youtube) {
+  mongoConnect();
+  const collection = mongoClient.db(DBNAME).collection("dev");
+  const tags = clickedVideo["tags"];
+  if (tags.length < 2) {
+    return;
+  }
+  const directTagSearchResults = await youtube.search.list({
+    part: ["snippet"],
+    q: `${tags[0]} ${tags[1]}`,
+    limit: 10
+  });
+
+  const numRandoms = 3;
+  let randomTagCombos = []
+  for (let i = 0; i < numRandoms; i++) {
+    const rand1 = Math.floor(Math.random()*tags.length);
+    let rand2 = Math.floor(Math.random()*tags.length);
+    if (rand1 == rand2) {
+      rand2 = (rand2 + 1 >= tags.length) ? 0 : rand2 + 1;
+    }
+    if (i < numRandoms - 1) {
+      randomTagCombos.push(`${rand1} ${rand2}%7C`);
+    } else {
+      randomTagCombos.push(`${rand1} ${rand2}`);
+    }
+  }
+
+  const randomTagSearchResults = await youtube.search.list({
+    part: ["snippet"],
+    q: randomTagCombos.join(''),
+    limit: 10
+  });
+
+  const videoIds = [];
+  directTagSearchResults["data"]["items"].forEach((item) => {
+    videoIds.push(item["id"]["videoId"]);
+  });
+  randomTagSearchResults["data"]["items"].forEach((item) => {
+    videoIds.push(item["id"]["videoId"]);
+  });
+  const bigFriendlyObject = await getDetailedVideoInfo(youtube, videoIds);
+  writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"], true);
+  const numAddedVideos = bigFriendlyObject.length; // TODO: Delete videos when there are enough
+
+  const bulkUpdates = []
+  for (let i = 0; i < videos.length; i++) {
+    const videoId = Object.keys(videos[i])[1];
+    let diff = -1;
+    if (clickedVideo["categoryId"] === videos[i][videoId]["categoryId"]) {
+      diff += 2;
+    }
+    if (clickedVideo["channelId"] === videos[i][videoId]["channelId"]) {
+      diff += 4;
+    }
+    if (clickedId === videoId) {
+      diff -= 25;
+    }
+    bulkUpdates.push(
+      {
+        updateOne: {
+          filter: { [`${cid}`]: {$exists: true}},
+          update: {$inc: { [`${cid}.data.${videoId}.rawScore`]: diff}}
+        }
+      }
+    );
+  }
+  try {
+    collection.bulkWrite(bulkUpdates);
+  } catch {
+    console.log("Error bulk-writing to database");
+  }
 }
 
 // TODO: Massage bfg video data to be mongo compatible
@@ -301,8 +361,8 @@ app.post("/firstpass", async (req, res) => {
 
   const filters = userData[cid]["settings"];
   const usageData = userData[cid]["data"];
-  if (!usageData && filters) {
-    const playlistItemsObj = await getVideosBySubscribers(youtube/*, {numSubscriptions: 100, numVideos: 40}*/);
+  if (!usageData) {
+    const playlistItemsObj = await getVideosBySubscribers(youtube, {numSubscriptions: 10, numVideos: 5});
 
     const idsList = [];
     playlistItemsObj.forEach((channel) => {
@@ -311,12 +371,15 @@ app.post("/firstpass", async (req, res) => {
       });
     });
     const bigFriendlyObject = await getDetailedVideoInfo(youtube, idsList);
-    const videos = bigFriendlyObject["data"]["items"];
 
-    writeVideoDataToDatabase(cid, mongoClient, bigFriendlyObject["data"]["items"]);
+    writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"], true);
+    if (filters) {
+      res.status(269).send();
+      return;
+    }
   }
 
-  res.status(269).send();
+  res.status(200).send();
 });
 
 app.post("/retrieveVideos", async (req, res) => {
@@ -357,7 +420,21 @@ app.post("/retrieveVideos", async (req, res) => {
   });
   const videosQuery = { $or: queryArray };
   const videos = await videosCollection.find(videosQuery).toArray();
-  const filteredVideos = filterVideos2(videos, filters);
+  const filteredVideos = filterVideos(videos, filters);
+  for (let i = 0; i < filteredVideos.length; i++) {
+    const videoId = Object.keys(filteredVideos[i])[1];
+    filteredVideos[i]["rawScore"] = usageData[videoId]["rawScore"];
+  }
+  
+  // Sort
+  try {
+    filteredVideos.sort((a,b) => (b.rawScore - a.rawScore));
+  } catch {
+    console.log("sorting didn't work (:");
+  }
+
+  req.session.lastPayload = filteredVideos;
+
   res.json(filteredVideos);
 });
 
@@ -458,6 +535,26 @@ app.post("/get_profile", async (req, res) => {
       other: true,
     });
   }
+});
+
+app.post("/video_clicked", async (req, res) => {
+  if (!req.session || !req.session.tokens) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const oauth2Client = getOAuth2Client(req);
+  const youtube = google.youtube({
+    version: "v3",
+    auth: oauth2Client,
+  });
+  const cid = await getChannelUid(youtube);
+  mongoConnect();
+
+  let adjustments = req.session.lastPayload;
+  adjustScoresOnClick(req.body.id, req.body.clickedVideo, adjustments, cid, youtube);
+
+  res.status(200).send();
 });
 
 app.post("/debug", async (req, res) => {
