@@ -155,7 +155,30 @@ function getDetailedVideoInfo(youtube, videoIds) {
   });
 }
 
-function writeVideoDataToDatabase(cid, bfg, recommended=false) {
+function getRelevantVideoFields(item) {
+  const videoTitle = item["snippet"]["title"];
+  const channelId = item["snippet"]["channelId"];
+  const channelTitle = item["snippet"]["channelTitle"];
+  const views = 0;
+  const uploadDate = "";
+  const videoLength = item["contentDetails"]["duration"];
+  const categoryId = item["snippet"]["categoryId"];
+  const tags = item["snippet"]["tags"];
+  const thumbnail = item["snippet"]["thumbnails"]["default"]["url"];
+  return {
+    videoTitle: videoTitle,
+    channelId: channelId,
+    channelTitle: channelTitle,
+    views: views,
+    uploadDate: uploadDate,
+    videoLength: videoLength,
+    categoryId: categoryId,
+    tags: tags,
+    thumbnail: thumbnail,
+  };
+}
+
+function writeVideoDataToDatabase(cid, bfg, rawScoreVal=50) {
   const videoDataWrites = [];
   const usageDataWrites = [];
   bfg.forEach((item) => {
@@ -163,22 +186,14 @@ function writeVideoDataToDatabase(cid, bfg, recommended=false) {
     const videoId = item["id"];
 
     // only video data
-    const videoTitle = item["snippet"]["title"];
-    const channelId = item["snippet"]["channelId"];
-    const channelTitle = item["snippet"]["channelTitle"];
-    const views = 0;
-    const uploadDate = "";
-    const videoLength = item["contentDetails"]["duration"];
-    const categoryId = item["snippet"]["categoryId"];
-    const tags = item["snippet"]["tags"];
-    const thumbnail = item["snippet"]["thumbnails"]["default"]["url"];
+    const videoDataObj = getRelevantVideoFields(item);
     // ...snippet.publishedAt (?)
 
     // only usage data
     const timeSpentWatching = 0;
     const numClicks = 0;
     const numTimesShown = 0;
-    const rawScore = recommended ? 57: 50;
+    const rawScore = rawScoreVal;
     const isLiked = 0; // -1, 0, 1
     const isSubscribed = false;
 
@@ -186,17 +201,7 @@ function writeVideoDataToDatabase(cid, bfg, recommended=false) {
       {
         updateOne: {
           filter: { [videoId]: {$exists: true}},
-          update: {$set: { [videoId]: {
-            videoTitle: videoTitle,
-            channelId: channelId,
-            channelTitle: channelTitle,
-            views: views,
-            uploadDate: uploadDate,
-            videoLength: videoLength,
-            categoryId: categoryId,
-            tags: tags,
-            thumbnail: thumbnail
-          }}},
+          update: {$set: { [videoId]: videoDataObj}},
           upsert: true
         }
       }
@@ -262,7 +267,7 @@ async function adjustScoresOnClick(clickedId, clickedVideo, videos, cid, youtube
   mongoConnect();
   const collection = mongoClient.db(DBNAME).collection("dev");
   const tags = clickedVideo["tags"];
-  if (tags.length < 2) {
+  if (!tags || !tags.length || tags.length < 2) {
     return;
   }
   const directTagSearchResults = await youtube.search.list({
@@ -300,7 +305,7 @@ async function adjustScoresOnClick(clickedId, clickedVideo, videos, cid, youtube
     videoIds.push(item["id"]["videoId"]);
   });
   const bigFriendlyObject = await getDetailedVideoInfo(youtube, videoIds);
-  writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"], true);
+  writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"], 57);
   const numAddedVideos = bigFriendlyObject.length; // TODO: Delete videos when there are enough
 
   const bulkUpdates = []
@@ -372,7 +377,7 @@ app.post("/firstpass", async (req, res) => {
     });
     const bigFriendlyObject = await getDetailedVideoInfo(youtube, idsList);
 
-    writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"], true);
+    writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"]);
     if (filters) {
       res.status(269).send();
       return;
@@ -445,6 +450,75 @@ async function getChannelUid(youtube) {
   });
   return data.data.items[0].id;
 }
+
+app.post("/search", async (req, res) => {
+  if (!req.session || !req.session.tokens) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const query = req.body;
+  console.log(query);
+  const cid = await getChannelUid(youtube);
+
+  const oauth2Client = getOAuth2Client(req);
+  const youtube = google.youtube({
+    version: "v3",
+    auth: oauth2Client,
+  });
+
+
+})
+
+app.post("/logSearchResults", async (req, res) => {
+  if (!req.session || !req.session.tokens) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const query = req.body;
+
+  mongoConnect();
+  const oauth2Client = getOAuth2Client(req);
+  const youtube = google.youtube({
+    version: "v3",
+    auth: oauth2Client,
+  });
+  const searchResults = await youtube.search.list({
+    part: ["snippet"],
+    q: query["query"]
+  });
+  console.log(searchResults["data"]["items"])
+  const videoIds = [];
+  searchResults["data"]["items"].forEach((item) => {
+    videoIds.push(item["id"]["videoId"]);
+  });
+  
+  const cid = await getChannelUid(youtube);
+  const bigFriendlyObject = await getDetailedVideoInfo(youtube, videoIds);
+  writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"], 9100);
+  res.status(269).send();
+});
+
+app.post("/delete_data", async (req, res) => {
+  if (!req.session || !req.session.tokens) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const oauth2Client = getOAuth2Client(req);
+  const youtube = google.youtube({
+    version: "v3",
+    auth: oauth2Client,
+  });
+  const cid = await getChannelUid(youtube);
+  mongoConnect();
+  const db = mongoClient.db(DBNAME);
+  const collection = db.collection("dev");
+  const query = {[`${cid}.data`] : {$exists : true}};
+  const update = {$unset : {[`${cid}.data`] : ""}};
+  collection.updateOne(query, update);
+});
 
 app.post("/logout", (req, res) => {
   const oauth2Client = getOAuth2Client(req);
