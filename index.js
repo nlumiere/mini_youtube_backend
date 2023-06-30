@@ -263,7 +263,7 @@ function filterVideos(videos, filters) {
   return filteredVideos;
 }
 
-async function adjustScoresOnClick(clickedId, clickedVideo, videos, cid, youtube) {
+async function adjustScoresOnClick(clickedId, clickedVideo, videos, cid, youtube, search=0) {
   mongoConnect();
   const collection = mongoClient.db(DBNAME).collection("dev");
   const tags = clickedVideo["tags"];
@@ -276,15 +276,15 @@ async function adjustScoresOnClick(clickedId, clickedVideo, videos, cid, youtube
     limit: 10
   });
 
-  const numRandoms = 3;
+  const NUM_RANDOMS = 3;
   let randomTagCombos = []
-  for (let i = 0; i < numRandoms; i++) {
+  for (let i = 0; i < NUM_RANDOMS; i++) {
     const rand1 = Math.floor(Math.random()*tags.length);
     let rand2 = Math.floor(Math.random()*tags.length);
     if (rand1 == rand2) {
       rand2 = (rand2 + 1 >= tags.length) ? 0 : rand2 + 1;
     }
-    if (i < numRandoms - 1) {
+    if (i < NUM_RANDOMS - 1) {
       randomTagCombos.push(`${rand1} ${rand2}%7C`);
     } else {
       randomTagCombos.push(`${rand1} ${rand2}`);
@@ -309,6 +309,9 @@ async function adjustScoresOnClick(clickedId, clickedVideo, videos, cid, youtube
   const numAddedVideos = bigFriendlyObject.length; // TODO: Delete videos when there are enough
 
   const bulkUpdates = []
+  if (search <= 0) {
+    search = videos.length;
+  }
   for (let i = 0; i < videos.length; i++) {
     const videoId = Object.keys(videos[i])[1];
     let diff = -1;
@@ -319,16 +322,33 @@ async function adjustScoresOnClick(clickedId, clickedVideo, videos, cid, youtube
       diff += 4;
     }
     if (clickedId === videoId) {
-      diff -= 25;
-    }
-    bulkUpdates.push(
-      {
-        updateOne: {
-          filter: { [`${cid}`]: {$exists: true}},
-          update: {$inc: { [`${cid}.data.${videoId}.rawScore`]: diff}}
+      bulkUpdates.push(
+        {
+          updateOne: {
+            filter: { [`${cid}`]: {$exists: true}},
+            update: {$set: { [`${cid}.data.${videoId}.rawScore`]: 45}}
+          }
         }
-      }
-    );
+      );
+    } else if (i >= search) {
+      bulkUpdates.push(
+        {
+          updateOne: {
+            filter: { [`${cid}`]: {$exists: true}},
+            update: {$unset: {[`${cid}.data.${videoId}.rawScore`] : ""}}
+          }
+        }
+      );
+    } else {
+      bulkUpdates.push(
+        {
+          updateOne: {
+            filter: { [`${cid}`]: {$exists: true}},
+            update: {$inc: {[`${cid}.data.${videoId}.rawScore`]: diff}}
+          }
+        }
+      );
+    }
   }
   try {
     collection.bulkWrite(bulkUpdates);
@@ -458,7 +478,7 @@ app.post("/search", async (req, res) => {
   }
 
   const query = req.body;
-  console.log(query);
+  console.log("Search still being called. This route is deprecated.");
   const cid = await getChannelUid(youtube);
 
   const oauth2Client = getOAuth2Client(req);
@@ -488,7 +508,6 @@ app.post("/logSearchResults", async (req, res) => {
     part: ["snippet"],
     q: query["query"]
   });
-  console.log(searchResults["data"]["items"])
   const videoIds = [];
   searchResults["data"]["items"].forEach((item) => {
     videoIds.push(item["id"]["videoId"]);
@@ -497,7 +516,7 @@ app.post("/logSearchResults", async (req, res) => {
   const cid = await getChannelUid(youtube);
   const bigFriendlyObject = await getDetailedVideoInfo(youtube, videoIds);
   writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"], 9100);
-  res.status(269).send();
+  res.json({numItems: videoIds.length});
 });
 
 app.post("/delete_data", async (req, res) => {
@@ -626,7 +645,7 @@ app.post("/video_clicked", async (req, res) => {
   mongoConnect();
 
   let adjustments = req.session.lastPayload;
-  adjustScoresOnClick(req.body.id, req.body.clickedVideo, adjustments, cid, youtube);
+  adjustScoresOnClick(req.body.id, req.body.clickedVideo, adjustments, cid, youtube, req.body.search);
 
   res.status(200).send();
 });
