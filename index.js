@@ -8,6 +8,9 @@ const session = require("express-session");
 require("dotenv").config();
 
 const MONGO_URI = `mongodb+srv://${process.env.MONGO_USERNAME}:${process.env.MONGO_PASSWORD}@proto.deabf88.mongodb.net/?retryWrites=true&w=majority`;
+const PASSPHRASE = process.env.PASSPHRASE;
+const SESSION_SECRET = process.env.SESSION;
+const DOMAIN = "http://localhost";
 
 const mongoClient = new MongoClient(MONGO_URI, {
   serverApi: {
@@ -22,14 +25,13 @@ const DBNAME = "app";
 async function mongoConnect() {
   try {
     await mongoClient.connect();
-    // console.log("connected to database");
   } catch (err) {
     console.error(err);
   }
 }
 
 const corsOptions = {
-  origin: "http://localhost:3001",
+  origin: `${DOMAIN}:3001`,
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
@@ -42,7 +44,7 @@ app.use(cors(corsOptions));
 app.use(
   session({
     name: 'connect.sid',
-    secret: "hehe-secret",
+    secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: true,
     cookie: { 
@@ -56,12 +58,16 @@ app.use(
 
 const YOUTUBE_CATEGORY_IDS = {
   10: "music",
+  15: "animals",
+  17: "sports",
   20: "gaming",
+  23: "comedy",
+  25: "news"
 }
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
-const REDIRECT_URI = "http://localhost:3000/auth/google/callback";
-const CLIENT_REDIRECT_URI = "http://localhost:3001";
+const REDIRECT_URI = `${DOMAIN}:3000/auth/google/callback`;
+const CLIENT_REDIRECT_URI = `${DOMAIN}:3001/`;
 const SCOPES = [
   "https://www.googleapis.com/auth/youtube",
   "https://www.googleapis.com/auth/plus.me",
@@ -164,7 +170,7 @@ function getRelevantVideoFields(item) {
   const videoLength = item["contentDetails"]["duration"];
   const categoryId = item["snippet"]["categoryId"];
   const tags = item["snippet"]["tags"];
-  const thumbnail = item["snippet"]["thumbnails"]["default"]["url"];
+  const thumbnail = item["snippet"]["thumbnails"]["medium"]["url"];
   return {
     videoTitle: videoTitle,
     channelId: channelId,
@@ -357,7 +363,84 @@ async function adjustScoresOnClick(clickedId, clickedVideo, videos, cid, youtube
   }
 }
 
-// TODO: Massage bfg video data to be mongo compatible
+async function getChannelUid(youtube=null, req=null) {
+  if (!youtube && req) {
+    const oauth2Client = getOAuth2Client(req);
+    youtube = google.youtube({
+      version: "v3",
+      auth: oauth2Client,
+    });
+  }
+  const data = await youtube.channels.list({
+    part: "snippet",
+    mine: true
+  });
+  return data.data.items[0].id;
+}
+
+async function getIsVerified(cid) {
+  const db = mongoClient.db(DBNAME);
+  const collection = db.collection("dev");
+  const query = {[`${cid}`]: {$exists: true}};
+  const dbres = await collection.findOne(query);
+  if (!dbres) {
+    return false;
+  }
+  return dbres[`${cid}`]["authenticated"];
+}
+
+async function getChannelUidAndVerify(youtube=null, req=null) {
+  const cid = await getChannelUid(youtube, req);
+  if (!cid) {
+    throw new Error("User does not exist");
+  }
+  mongoConnect();
+  const isVerified = await getIsVerified(cid);  
+  if (!isVerified) {
+    throw new Error("User is unverified. This app is in closed alpha.");
+  }
+  return cid;
+}
+
+
+/*************************** ROUTES ***************************/
+
+app.post("/verify-user", async (req, res) => {
+  if (!req.session.tokens) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const cid = await getChannelUid(null, req);
+  mongoConnect();
+
+  if (req.body.passphrase === PASSPHRASE) {
+    const db = mongoClient.db(DBNAME);
+    const collection = db.collection("dev");
+    const query = {[`${cid}`]: {$exists: true}};
+    const update = {$set: {[`${cid}.authenticated`]: true}};
+    await collection.updateOne(query, update, {upsert: true});
+    res.status(200).send();
+  } else {
+    res.status(403).send();
+  }
+});
+
+app.post("/check-verified", async (req, res) => {
+  if (!req.session.tokens) {
+    res.status(401).send("Unauthorized");
+    return;
+  }
+
+  const cid = await getChannelUid(null, req);
+  const isVerified = await getIsVerified(cid);
+  if (isVerified) {
+    res.status(200).send();
+  } else {
+    res.status(201).send();
+  }
+})
+
 app.post("/firstpass", async (req, res) => {
   const oauth2Client = getOAuth2Client(req);
 
@@ -373,43 +456,44 @@ app.post("/firstpass", async (req, res) => {
     auth: oauth2Client,
   });
 
-  const cid = await getChannelUid(youtube);
+  try {
+    const cid = await getChannelUidAndVerify(youtube);
+    const db = mongoClient.db(DBNAME);
+    const collection = db.collection("dev");
+    const query = {[`${cid}.settings`]: {$exists: true}};
+    const userData = await collection.findOne(query);
 
-  const db = mongoClient.db(DBNAME);
-  const collection = db.collection("dev");
-  const query = {[`${cid}.settings`]: {$exists: true}};
-  const userData = await collection.findOne(query);
-
-  if (!userData) {
-    return;
-  }
-
-  const filters = userData[cid]["settings"];
-  const usageData = userData[cid]["data"];
-  if (!usageData) {
-    const playlistItemsObj = await getVideosBySubscribers(youtube, {numSubscriptions: 10, numVideos: 5});
-
-    const idsList = [];
-    playlistItemsObj.forEach((channel) => {
-      channel.forEach((item) => {
-        idsList.push(item["snippet"]["resourceId"]["videoId"]);
-      });
-    });
-    const bigFriendlyObject = await getDetailedVideoInfo(youtube, idsList);
-
-    writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"]);
-    if (filters) {
-      res.status(269).send();
+    if (!userData) {
       return;
     }
-  }
 
-  res.status(200).send();
+    const filters = userData[cid]["settings"];
+    const usageData = userData[cid]["data"];
+    if (!usageData) {
+      const playlistItemsObj = await getVideosBySubscribers(youtube, {numSubscriptions: 10, numVideos: 5});
+
+      const idsList = [];
+      playlistItemsObj.forEach((channel) => {
+        channel.forEach((item) => {
+          idsList.push(item["snippet"]["resourceId"]["videoId"]);
+        });
+      });
+      const bigFriendlyObject = await getDetailedVideoInfo(youtube, idsList);
+
+      writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"]);
+      if (filters) {
+        res.status(269).send();
+        return;
+      }
+    }
+
+    res.status(200).send();
+  } catch {
+    res.status(403).send();
+  }
 });
 
 app.post("/retrieveVideos", async (req, res) => {
-  const oauth2Client = getOAuth2Client(req);
-
   mongoConnect();
 
   if (!req.session.tokens) {
@@ -417,78 +501,49 @@ app.post("/retrieveVideos", async (req, res) => {
     return;
   }
 
-  const youtube = google.youtube({
-    version: "v3",
-    auth: oauth2Client,
-  });
-
-  const cid = await getChannelUid(youtube);
-
-  const db = mongoClient.db(DBNAME);
-  const usageCollection = db.collection("dev");
-  const videosCollection = db.collection("videos");
-  const usageQuery = {[`${cid}.settings`]: {$exists: true}};
-  const userData = await usageCollection.findOne(usageQuery);
-
-  if (!userData) {
-    return;
-  }
-
-  const filters = userData[cid]["settings"];
-  const usageData = userData[cid]["data"];
-
-  if (!filters || !usageData) {
-    return;
-  }
-  const queryArray = Object.keys(usageData).map((key) => {
-    return {[key]: {$exists: true}};
-  });
-  const videosQuery = { $or: queryArray };
-  const videos = await videosCollection.find(videosQuery).toArray();
-  const filteredVideos = filterVideos(videos, filters);
-  for (let i = 0; i < filteredVideos.length; i++) {
-    const videoId = Object.keys(filteredVideos[i])[1];
-    filteredVideos[i]["rawScore"] = usageData[videoId]["rawScore"];
-  }
-  
-  // Sort
   try {
-    filteredVideos.sort((a,b) => (b.rawScore - a.rawScore));
+    const cid = await getChannelUidAndVerify(null, req);
+    const db = mongoClient.db(DBNAME);
+    const usageCollection = db.collection("dev");
+    const videosCollection = db.collection("videos");
+    const usageQuery = {[`${cid}.settings`]: {$exists: true}};
+    const userData = await usageCollection.findOne(usageQuery);
+
+    if (!userData) {
+      return;
+    }
+
+    const filters = userData[cid]["settings"];
+    const usageData = userData[cid]["data"];
+
+    if (!filters || !usageData) {
+      return;
+    }
+    const queryArray = Object.keys(usageData).map((key) => {
+      return {[key]: {$exists: true}};
+    });
+    const videosQuery = { $or: queryArray };
+    const videos = await videosCollection.find(videosQuery).toArray();
+    const filteredVideos = filterVideos(videos, filters);
+    for (let i = 0; i < filteredVideos.length; i++) {
+      const videoId = Object.keys(filteredVideos[i])[1];
+      filteredVideos[i]["rawScore"] = usageData[videoId]["rawScore"];
+    }
+    
+    // Sort
+    try {
+      filteredVideos.sort((a,b) => (b.rawScore - a.rawScore));
+    } catch {
+      console.log("sorting didn't work (:");
+    }
+
+    req.session.lastPayload = filteredVideos;
+
+    res.json(filteredVideos);
   } catch {
-    console.log("sorting didn't work (:");
+    res.status(403).send();
   }
-
-  req.session.lastPayload = filteredVideos;
-
-  res.json(filteredVideos);
 });
-
-async function getChannelUid(youtube) {
-  const data = await youtube.channels.list({
-    part: "snippet",
-    mine: true
-  });
-  return data.data.items[0].id;
-}
-
-app.post("/search", async (req, res) => {
-  if (!req.session || !req.session.tokens) {
-    res.status(401).send("Unauthorized");
-    return;
-  }
-
-  const query = req.body;
-  console.log("Search still being called. This route is deprecated.");
-  const cid = await getChannelUid(youtube);
-
-  const oauth2Client = getOAuth2Client(req);
-  const youtube = google.youtube({
-    version: "v3",
-    auth: oauth2Client,
-  });
-
-
-})
 
 app.post("/logSearchResults", async (req, res) => {
   if (!req.session || !req.session.tokens) {
@@ -513,10 +568,14 @@ app.post("/logSearchResults", async (req, res) => {
     videoIds.push(item["id"]["videoId"]);
   });
   
-  const cid = await getChannelUid(youtube);
-  const bigFriendlyObject = await getDetailedVideoInfo(youtube, videoIds);
-  writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"], 9100);
-  res.json({numItems: videoIds.length});
+  try {
+    const cid = await getChannelUidAndVerify(youtube);
+    const bigFriendlyObject = await getDetailedVideoInfo(youtube, videoIds);
+    writeVideoDataToDatabase(cid, bigFriendlyObject["data"]["items"], 9100);
+    res.json({numItems: videoIds.length});
+  } catch {
+    res.status(403).send();
+  }
 });
 
 app.post("/delete_data", async (req, res) => {
@@ -525,18 +584,17 @@ app.post("/delete_data", async (req, res) => {
     return;
   }
 
-  const oauth2Client = getOAuth2Client(req);
-  const youtube = google.youtube({
-    version: "v3",
-    auth: oauth2Client,
-  });
-  const cid = await getChannelUid(youtube);
-  mongoConnect();
-  const db = mongoClient.db(DBNAME);
-  const collection = db.collection("dev");
-  const query = {[`${cid}.data`] : {$exists : true}};
-  const update = {$unset : {[`${cid}.data`] : ""}};
-  collection.updateOne(query, update);
+  try {
+    const cid = await getChannelUidAndVerify(null, req);
+    mongoConnect();
+    const db = mongoClient.db(DBNAME);
+    const collection = db.collection("dev");
+    const query = {[`${cid}.data`] : {$exists : true}};
+    const update = {$unset : {[`${cid}.data`] : ""}};
+    collection.updateOne(query, update);
+  } catch {
+    res.status(403).send();
+  }
 });
 
 app.post("/logout", (req, res) => {
@@ -555,7 +613,7 @@ app.post("/logout", (req, res) => {
       scope: SCOPES,
     });
     res.clearCookie('connect.sid', { path: '/', sameSite: 'lax', httpOnly: true, secure: false,maxAge: 24 * 60 * 60 * 1000 });
-    res.redirect(CLIENT_REDIRECT_URI);
+    res.status(200).send();
   });
 });
 
@@ -580,25 +638,23 @@ app.post("/update_profile", async (req, res) => {
     req.body["vidlength"] = 0;
   }
 
-  const oauth2Client = getOAuth2Client(req);
-  const youtube = google.youtube({
-    version: "v3",
-    auth: oauth2Client,
-  });
+  try {
+    cid = await getChannelUid(null, req);
+    mongoConnect();
 
-  const cid = await getChannelUid(youtube);
-  mongoConnect();
-
-  const db = mongoClient.db(DBNAME);
-  const collection = db.collection("dev");
-  const query = {[`${cid}.settings`]: {$exists: true}};
-  const update = {
-    $set: {
-      [`${cid}.settings`]: req.body
+    const db = mongoClient.db(DBNAME);
+    const collection = db.collection("dev");
+    const query = {[`${cid}`]: {$exists: true}};
+    const update = {
+      $set: {
+        [`${cid}.settings`]: req.body,
+      }
     }
+    collection.updateOne(query, update, {upsert: true});
+    res.json({status: "happy"});
+  } catch {
+    res.status(403).send();
   }
-  collection.updateOne(query, update, {upsert: true});
-  res.json({status: "happy"});
 });
 
 app.post("/get_profile", async (req, res) => {
@@ -607,26 +663,28 @@ app.post("/get_profile", async (req, res) => {
     return;
   }
 
-  const oauth2Client = getOAuth2Client(req);
-  const youtube = google.youtube({
-    version: "v3",
-    auth: oauth2Client,
-  });
-  const cid = await getChannelUid(youtube);
-  mongoConnect();
-  const db = mongoClient.db(DBNAME);
-  const collection = db.collection("dev");
-  const query = {[`${cid}.settings`]: {$exists: true}};
-  const dbres = await collection.findOne(query);
   try {
-    res.json(dbres[`${cid}`]["settings"]);
+    const cid = await getChannelUid(null, req);
+    mongoConnect();
+    const db = mongoClient.db(DBNAME);
+    const collection = db.collection("dev");
+    const query = {[`${cid}.settings`]: {$exists: true}};
+    const dbres = await collection.findOne(query);
+    try {
+      res.json(dbres[`${cid}`]["settings"]);
+    } catch {
+      res.json({
+        vidlength: "0",
+        gaming: true,
+        music: true,
+        news: true,
+        animals: true,
+        sports: true,
+        comedy: true
+      });
+    }
   } catch {
-    res.json({
-      vidlength: "0",
-      gaming: true,
-      music: true,
-      other: true,
-    });
+    res.status(403).send();
   }
 });
 
@@ -641,13 +699,18 @@ app.post("/video_clicked", async (req, res) => {
     version: "v3",
     auth: oauth2Client,
   });
-  const cid = await getChannelUid(youtube);
-  mongoConnect();
+  
+  try {
+    const cid = await getChannelUidAndVerify(youtube);
+    mongoConnect();
 
-  let adjustments = req.session.lastPayload;
-  adjustScoresOnClick(req.body.id, req.body.clickedVideo, adjustments, cid, youtube, req.body.search);
+    let adjustments = req.session.lastPayload;
+    adjustScoresOnClick(req.body.id, req.body.clickedVideo, adjustments, cid, youtube, req.body.search);
 
-  res.status(200).send();
+    res.status(200).send();
+  } catch {
+    res.status(403).send();
+  }
 });
 
 app.post("/debug", async (req, res) => {
